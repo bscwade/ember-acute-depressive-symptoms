@@ -1,0 +1,729 @@
+---
+title: "LMM Models"
+author: "Benjamin Wade"
+format: html
+editor: visual
+---
+
+# Notes
+
+## Helper functions
+
+```{r}
+# log-mod transformation 
+log_mod_transform <- function(x){
+  lmt <- sign(x) * log(abs(x) + 1)
+  return(lmt)
+}
+
+# reverse log-mod transformation
+log_inv_transform <- function(x){
+  inv_lmt <- sign(x) * (exp(abs(x)) - 1)
+  return(inv_lmt)
+}
+
+# power calculation
+power_estimate <- function(fit, fixed_effect, es, nsim=50){
+  fixef(fit)[fixed_effect] <- es
+  set.seed(123)
+  res <- powerSim(fit, test = fixed(fixed_effect, "t"), nsim = nsim)
+  print(res)
+}
+```
+
+## Load and format data
+
+```{r}
+#| include: false
+require(lme4)
+require(lmerTest)
+require(sjPlot)
+require(sjmisc)
+require(effects)
+require(sjstats)
+require(ggplot2)
+require(ggrepel)
+require(ggpubr)
+require(ggeffects)
+require(tidyverse)
+require(dplyr)
+require(tableone)
+require(knitr)
+require(lcmm)
+require(reshape2)
+require(MuMIn)
+require(mediation)
+require(tableone)
+require(performance)
+require(gtsummary)
+require(emmeans)
+require(simr)
+
+emm_options(pbkrtest.limit = 6000)
+emm_options(rg.limit = 900000)
+```
+
+```{r}
+per_protocol_cohort <- FALSE
+days_contrast <- c(-10, 0, 1, 5, 10, 12, 15, 30, 45)
+est_power <- FALSE
+save_table <- TRUE
+path_figures <- NULL
+path_tables <- '/path/to/tables/'
+```
+
+```{r}
+# load formatted data
+load('/path/to.Rdata')
+
+# make time_first_infusion_to_phq numeric
+ember_data$time_first_infusion_to_phq <- as.numeric(ember_data$time_first_infusion_to_phq)
+
+# Center time variable: No scaling
+ember_data$time_first_infusion_to_phq_centered <- scale(ember_data$time_first_infusion_to_phq, center = TRUE, scale = FALSE)
+
+# Add log-modulus transformation of time to handle negative cases
+ember_data$time_first_infusion_to_phq_log_mod <- log_mod_transform(as.numeric(ember_data$time_first_infusion_to_phq))
+
+# center and scale age
+ember_data$age_years_centered_scaled <- scale(ember_data$age_years, center = TRUE, scale = TRUE)
+
+# add baseline symptoms and save persistent version
+ember_data_saved <- ember_data %>%
+  group_by(client_id) %>%
+  arrange(date_submitted_phq, .by_group = TRUE) %>%
+  mutate(baseline_phq = dplyr::first(phq_tot), 
+         end_phq = dplyr::last(phq_tot),
+         min_phq = min(phq_tot), 
+         days_first_infusion_to_final_phq = last(date_submitted_phq) - first_infusion_completed,
+         days_first_phq_to_final_phq = last(date_submitted_phq) - first(date_submitted_phq),
+         baseline_si_any = ifelse(dplyr::first(phq9) > 0, 1, 0),
+         baseline_si_mod_sev = ifelse(dplyr::first(phq9) > 1, 1, 0),
+         end_si_any = ifelse(dplyr::last(phq9) > 0, 1, 0),
+         end_si_mod_sev = ifelse(dplyr::last(phq9) > 1, 1, 0),
+         baseline_si_score = first(phq9),
+         end_si_score = last(phq9),
+         min_si_score = min(phq9))
+
+# sex as factor
+ember_data_saved$sex_assigned_at_birth <- as.factor(ember_data_saved$sex_assigned_at_birth)
+
+# reset medication names to old codes
+ember_data_saved <- ember_data_saved %>%
+  rename("antidepressant_load"="antidepressant",
+         "antipsychotic_load"="antipsychotic",
+         "stimulant_load"="stimulant",
+         "benzodiazepine_load"="benzodiazepine",
+         "mood_stabilizer_load"="mood_stabilizer",
+         "non_benzodiazepine_anxiolytic_sedative_load"="nbas",
+         "other_psychotropic_medication_load"="other_psychotropic_medication")
+
+# # drop zero-variance variable(s)
+# ember_data_saved <- ember_data_saved %>%
+#   dplyr::select(-non_benzodiazepine_anxiolytic_sedative_load)
+
+# set NA medications to zero
+ember_data_saved$antidepressant_load[which(is.na(ember_data_saved$antidepressant_load))] <- 0
+ember_data_saved$antipsychotic_load[which(is.na(ember_data_saved$antipsychotic_load))] <- 0
+ember_data_saved$benzodiazepine_load[which(is.na(ember_data_saved$benzodiazepine_load))] <- 0
+ember_data_saved$non_benzodiazepine_anxiolytic_sedative_load[which(is.na(ember_data_saved$non_benzodiazepine_anxiolytic_sedative_load))] <- 0
+ember_data_saved$mood_stabilizer_load[which(is.na(ember_data_saved$mood_stabilizer_load))] <- 0
+ember_data_saved$other_psychotropic_medication_load[which(is.na(ember_data_saved$other_psychotropic_medication_load))] <- 0
+ember_data_saved$stimulant_load[which(is.na(ember_data_saved$stimulant_load))] <- 0
+
+# binarize medications: 0 = 0; 1 = > 0
+ember_data_saved <- ember_data_saved %>%
+  mutate(antidepressant_load = factor(ifelse(antidepressant_load > 0, 1, 0))) %>%
+  mutate(antipsychotic_load = factor(ifelse(antipsychotic_load > 0, 1, 0))) %>%
+  mutate(benzodiazepine_load = factor(ifelse(benzodiazepine_load > 0, 1, 0))) %>%
+  mutate(non_benzodiazepine_anxiolytic_sedative_load = factor(ifelse(non_benzodiazepine_anxiolytic_sedative_load > 0, 1, 0))) %>%
+  mutate(mood_stabilizer_load = factor(ifelse(mood_stabilizer_load > 0, 1, 0))) %>%
+  mutate(other_psychotropic_medication_load = factor(ifelse(other_psychotropic_medication_load > 0, 1, 0))) %>%
+  mutate(stimulant_load = factor(ifelse(stimulant_load > 0, 1, 0))) %>%
+  as.data.frame()
+
+# set reference level for medications
+ember_data_saved$antidepressant_load <- relevel(ember_data_saved$antidepressant_load, ref = "0")
+ember_data_saved$antipsychotic_load <- relevel(ember_data_saved$antipsychotic_load, ref = "0")
+ember_data_saved$benzodiazepine_load <- relevel(ember_data_saved$benzodiazepine_load, ref = "0")
+ember_data_saved$non_benzodiazepine_anxiolytic_sedative_load <- relevel(ember_data_saved$non_benzodiazepine_anxiolytic_sedative_load, ref = "0")
+ember_data_saved$mood_stabilizer_load <- relevel(ember_data_saved$mood_stabilizer_load, ref = "0")
+ember_data_saved$stimulant_load <- relevel(ember_data_saved$stimulant_load, ref = "0")
+ember_data_saved$other_psychotropic_medication_load <- relevel(ember_data_saved$other_psychotropic_medication_load, ref = "0")
+
+# set reference level for age cagtegory
+ember_data_saved$age_bin <- relevel(ember_data_saved$age_bin, ref = 'adult')
+```
+
+## Apply I/E Criteria
+
+```{r}
+# per protocol only
+if(per_protocol_cohort){
+  print("Per Protocol Cohort")
+  ember_data_saved <- ember_data_saved %>% filter(per_protocol == 1)
+}else{
+  print("Intention to Treat Cohort")
+}
+
+# exclude adolescents
+adolecent_ids <- unique(ember_data_saved$client_id[which(ember_data_saved$age_years < 18)])
+ember_data_saved <- ember_data_saved[!ember_data_saved$client_id %in% adolecent_ids, ]
+
+ember_data_saved <- ember_data_saved %>%
+  filter(age_bin != 'adolescent')
+ember_data_saved$age_bin <- droplevels(ember_data_saved$age_bin)
+
+# exclude anyone in pre-treatment or ongoing treatment phase
+ember_data_saved <- ember_data_saved %>% filter(foundation_completion_status != "Pre/In Treatment")
+
+# exclude long-term care (LTC) visits
+ember_data_saved <- ember_data_saved[ember_data_saved$date_submitted_phq <= ember_data_saved$first_ltc_infusion_date | is.na(ember_data_saved$first_ltc_infusion_date), ]
+
+# exclude outcomes with missing underlying items
+missing_items <- which(is.na(ember_data_saved[, grep('phq[1-9]$', names(ember_data_saved), value = T)]), arr.ind = T)
+missing_items <- missing_items[, 1]
+
+print(sprintf("Excluding outcomes from %s observations", length(missing_items)))
+print(ember_data_saved$client_id[missing_items])
+
+ember_data_saved$phq_tot[missing_items] <- NA
+```
+
+## Patient Table
+
+```{r}
+tab <-
+  ember_data_saved %>%
+  mutate(primary_diagnosis = ifelse(primary_diagnosis_bipolar==1, "BD", "MDD")) %>%
+  group_by(client_id) %>%
+  arrange(date_submitted_phq, .by_group = TRUE) %>%
+  mutate(baseline_phq = dplyr::first(phq_tot), 
+         end_phq = dplyr::last(phq_tot)) %>%
+  slice_min(order_by = date_submitted_phq, n = 1) %>%
+  rename("sex"="sex_assigned_at_birth",
+         "age"="age_years",
+         "health_insurance"="do_you_have_health_insurance",
+         "two_meds_five_years"="have_you_tried_more_than_two_medications_for_your_depressive_symptoms_in_the_past_five_years",
+         "two_meds_lifetime"="have_you_tried_more_than_two_medications_for_your_depressive_symptoms_in_your_lifetime",
+         "tried_tms"="have_you_tried_transcranial_magnetic_stimulation_tms",
+         "tried_ect"="have_you_tried_electroconvulsive_therapy_ect",
+         "tobacco"="use_tobacco_yes",
+         "cannabis"="use_cannabis_yes",
+         "alcohol"="drink_alcohol_yes",
+         "other_substances"="use_other_recreational_substances_yes",
+         "heart_disease_stroke"="heart_disease_stroke_yes",
+         "high_bp"="high_blood_pressure_yes",
+         "diabetes"="diabetes_yes",
+         "cancer"="cancer_specify_type_yes",
+         "bipolar"="primary_diagnosis_bipolar",
+         "anxiety"="comorbid_anxiety",
+         "ocd"="comorbid_ocd",
+         "ptsd"="comorbid_ptsd",
+         "sud"="comorbid_sud") %>%
+  ungroup() %>%
+  distinct(client_id, .keep_all = TRUE) %>%
+  tbl_summary(include = c(age, age_bin, sex, baseline_phq, end_phq, min_phq, baseline_si_any, end_si_any, baseline_si_mod_sev, end_si_mod_sev, baseline_si_score, end_si_score, min_si_score, days_first_infusion_to_final_phq, days_first_phq_to_final_phq, foundation_completion_status,
+                          health_insurance,two_meds_five_years,two_meds_lifetime, tried_tms,
+                          tried_ect, tobacco, cannabis, alcohol, other_substances,
+                          heart_disease_stroke, high_bp, diabetes, cancer, anxiety,
+                          ocd, ptsd, sud, antidepressant_load, antipsychotic_load, benzodiazepine_load, non_benzodiazepine_anxiolytic_sedative_load,
+                          mood_stabilizer_load,
+                          stimulant_load, other_psychotropic_medication_load),
+              by=primary_diagnosis,
+              statistic = list(all_continuous() ~ "{mean} ({sd})"),
+              digits = list(all_continuous() ~ 1)) %>%
+  add_overall() %>%
+  add_p() %>%
+  separate_p_footnotes() %>%
+  modify_header(label = "**Variable**") %>%
+  add_variable_group_header(
+    header = "Demographics",
+    variables = c("age", "age_bin", "sex")) %>%
+  add_variable_group_header(
+    header = "Symptoms",
+    variables = c("baseline_phq", "end_phq", "min_phq", "baseline_si_any", "end_si_any", "baseline_si_mod_sev", "end_si_mod_sev", "baseline_si_score", "end_si_score", "min_si_score", "days_first_infusion_to_final_phq", "days_first_phq_to_final_phq")) %>%
+  add_variable_group_header(
+    header = "Comorbid Psychiatric",
+    variables = c("anxiety", "ocd", "ptsd", "sud")) %>%
+  add_variable_group_header(
+    header = "General Health",
+    variables = c("heart_disease_stroke", "high_bp",
+                  "diabetes", "cancer", "tobacco", 
+                  "cannabis", "alcohol")) %>%
+  add_variable_group_header(
+    header = "Medications",
+    variables = ends_with("_load")) %>%
+  bold_labels()
+
+tab
+
+if(save_table){
+  gt_table <- as_gt(tab) 
+  gt::gtsave(gt_table, filename = paste0(path_tables, "ember_table_1.docx")) 
+}
+```
+
+## Time Point Frequency
+
+```{r}
+hist(as.numeric(ember_data_saved$time_first_infusion_to_phq), 
+     col = 'steelblue', 
+     xlab = "Days", 
+     main = "Days First Foundational Infusion to PHQ")
+
+hist(as.numeric(ember_data_saved$time_last_foundational_infusion_to_phq),
+      col = 'steelblue', 
+     xlab = "Days", 
+     main = "Days Last Foundational Infusion to PHQ")
+```
+
+## Plot functions
+
+```{r}
+plot_trajectories_by_group <- function(fit, diagnosis, days_list, diagnosis_2 = NULL, num_levels = NULL){
+  
+  if(!is.null(num_levels)){
+    col_palette <- c("steelblue2", "firebrick3", "chartreuse")
+  }else{
+    col_palette <- c("steelblue2", "firebrick3")
+  }
+  
+  if(!is.null(diagnosis_2)){
+    form <- as.formula(paste(diagnosis, "~ time_first_infusion_to_phq_log_mod | ", diagnosis_2))
+  }else{
+    form <- as.formula(paste(diagnosis, "~ time_first_infusion_to_phq_log_mod"))  
+  }
+  
+  plt_data <- emmip(fit, form,
+                    CI = TRUE,
+                    type = "response",
+                    at = list(time_first_infusion_to_phq_log_mod = c(log_mod_transform(days_list)))) + 
+    labs(x = "Days from first infusion to PHQ-9", y = "Predicted PHQ-9 score") +
+    scale_color_manual(values = col_palette) + 
+    theme_bw()
+  
+  plt_data$data <- plt_data$data %>%
+    as.data.frame() %>%
+    mutate(xvar = log_inv_transform(xvar))
+  
+  plt_data
+}
+```
+
+## Effect size for estimated marginal means function
+
+```{r}
+tabulate_effect_size <- function(fit, diagnosis, days_list){
+  
+  form <- as.formula(paste0("revpairwise ~ ", diagnosis, "| time_first_infusion_to_phq_log_mod")) 
+  
+  emm <- emmeans(fit, 
+             specs = form,
+             at = list(time_first_infusion_to_phq_log_mod = log_mod_transform(days_contrast)),
+             infer = TRUE,
+             null = 0,
+             adjust = "mvt")
+  
+  # transform grid to time in days: inverse log transform
+  emm$contrasts@levels$time_first_infusion_to_phq_log_mod <- log_inv_transform(emm$contrasts@levels$time_first_infusion_to_phq_log_mod)
+  emm$contrasts@grid$time_first_infusion_to_phq_log_mod <- log_inv_transform(emm$contrasts@grid$time_first_infusion_to_phq_log_mod)
+
+  
+  # Calculate Cohen's d
+  sigma_value <- sigma(fit)          # Population SD
+  edf_value <- df.residual(fit)      # Degrees of freedom
+  cd <- eff_size(emm, sigma = sigma_value, edf = edf_value)
+  
+  print(cd)
+
+}
+
+```
+
+## Model 1: Symptoms over time
+
+```{r}
+predictors <- c("baseline_phq", "age_years_centered_scaled",
+                  "sex_assigned_at_birth", "per_protocol",
+                  grep("^comorbid_|^primary_diagnosis|baseline_si_any", names(ember_data_saved), value=TRUE),
+                  grep('^total', grep('load$', names(ember_data_saved), value = T), value = T, invert = T))
+
+fixed_effects <- paste0(paste0(predictors, collapse=" + "), " + time_first_infusion_to_phq_log_mod")
+  
+form <- reformulate(paste(fixed_effects, "+ (1 | client_id)"), response='phq_tot')
+
+print(form)
+  
+fit_log_mod <- lmer(form, data = ember_data_saved, REML = FALSE)
+```
+
+### Coefficient table
+
+```{r}
+sjPlot::tab_model(fit_log_mod, p.adjust = "fdr", show.stat = TRUE, show.df = TRUE,
+                  file = paste0(path_tables, 'ember_coefficient_table_main_effects.doc'))
+```
+
+### Plot predicted symptom trajectories
+
+```{r}
+ggpredict(fit_log_mod, "time_first_infusion_to_phq_log_mod [sample=50]") %>%
+  as.data.frame() %>%
+  mutate(x = sign(x) * exp(abs(x)) - 1) %>% # convert log-mod-time to original scale: sign(x) * (exp(abs(x)) - 1) 
+  ggplot(aes(x = x, y = predicted)) +
+  geom_line(col = 'steelblue2', linewidth = 1) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
+  labs(x = "Days from first infusion to PHQ-9", y = "Predicted PHQ-9 score") +
+  theme_bw()
+```
+
+### Model diagnostics
+
+```{r}
+#| fig-height: 10
+#| fig-width: 8
+performance::check_model(fit_log_mod)
+
+if(est_power){
+ power_estimate(fit_log_mod, fixed_effect = "time_first_infusion_to_phq_log_mod", es = 0.3) 
+}
+```
+
+## Model 2: Symptoms over time: categorical age
+
+```{r}
+predictors <- c("baseline_phq", "age_bin",
+                  "sex_assigned_at_birth", "per_protocol",
+                  grep("^comorbid_|^primary_diagnosis|baseline_si_any", names(ember_data_saved), value=TRUE),
+                  grep('^total', grep('load$', names(ember_data_saved), value = T), value = T, invert = T))
+
+fixed_effects <- paste0(paste0(predictors, collapse=" + "), " + time_first_infusion_to_phq_log_mod")
+  
+form <- reformulate(paste(fixed_effects, "+ (1 | client_id)"), response='phq_tot')
+
+print(form)
+  
+fit_log_mod_age_bin <- lmer(form, data = ember_data_saved, REML = FALSE)
+```
+
+### Coefficient table
+
+```{r}
+sjPlot::tab_model(fit_log_mod_age_bin, p.adjust = "fdr", show.stat = TRUE, show.df = TRUE,
+                  file = paste0(path_tables, 'ember_coefficient_table_main_effects.doc'))
+```
+
+## Model 3: Interactions with time
+
+```{r}
+fit_unified_log_mod_time <- 
+  lmer(phq_tot ~ baseline_phq + time_first_infusion_to_phq_log_mod *   
+         (sex_assigned_at_birth + age_years_centered_scaled + per_protocol + 
+                                                 primary_diagnosis_bipolar + comorbid_anxiety + 
+                                                 comorbid_ocd + comorbid_ptsd + comorbid_sud + 
+                                                 baseline_si_any + 
+                                                 antidepressant_load + antipsychotic_load + 
+                                                 benzodiazepine_load + non_benzodiazepine_anxiolytic_sedative_load + 
+                                                 mood_stabilizer_load + 
+                                                 stimulant_load + 
+                                                 other_psychotropic_medication_load) +
+         (1|client_id), 
+       data = ember_data_saved, 
+       REML = TRUE)
+```
+
+### Coefficient table
+
+```{r}
+sjPlot::tab_model(fit_unified_log_mod_time, p.adjust = "fdr", show.stat = TRUE, show.df = TRUE,
+                  file = paste0(path_tables, 'ember_coefficient_table_interaction_effects.doc'))
+```
+
+### Plot predicted symptom trajectories by primary diagnosis
+
+```{r}
+plot_trajectories_by_group(fit = fit_unified_log_mod_time,
+                           diagnosis = 'primary_diagnosis_bipolar',
+                           days_list = days_contrast) 
+```
+
+### Report effect sizes
+
+```{r}
+tabulate_effect_size(fit = fit_unified_log_mod_time, 
+                           diagnosis = 'primary_diagnosis_bipolar',
+                           days_list = days_contrast)
+```
+
+### Plot predicted symptom trajectories by anxiety
+
+```{r}
+plot_trajectories_by_group(fit = fit_unified_log_mod_time,
+                           diagnosis = 'comorbid_anxiety',
+                           days_list = days_contrast) 
+```
+
+### Report effect sizes
+
+```{r}
+tabulate_effect_size(fit = fit_unified_log_mod_time, 
+                           diagnosis = 'comorbid_anxiety',
+                           days_list = days_contrast)
+```
+
+### Plot predicted symptom trajectories by OCD
+
+```{r}
+plot_trajectories_by_group(fit = fit_unified_log_mod_time,
+                           diagnosis = 'comorbid_ocd',
+                           days_list = days_contrast) 
+```
+
+### Report effect sizes
+
+```{r}
+tabulate_effect_size(fit = fit_unified_log_mod_time, 
+                           diagnosis = 'comorbid_ocd',
+                           days_list = days_contrast)
+```
+
+### Plot predicted symptom trajectories by PTSD
+
+```{r}
+plot_trajectories_by_group(fit = fit_unified_log_mod_time,
+                           diagnosis = 'comorbid_ptsd',
+                           days_list = days_contrast) 
+```
+
+### Report effect sizes
+
+```{r}
+tabulate_effect_size(fit = fit_unified_log_mod_time, 
+                           diagnosis = 'comorbid_ptsd',
+                           days_list = days_contrast)
+```
+
+### Plot predicted symptom trajectories by SUD
+
+```{r}
+plot_trajectories_by_group(fit = fit_unified_log_mod_time,
+                           diagnosis = 'comorbid_sud',
+                           days_list = days_contrast) 
+```
+
+### Report effect sizes
+
+```{r}
+tabulate_effect_size(fit = fit_unified_log_mod_time, 
+                           diagnosis = 'comorbid_sud',
+                           days_list = days_contrast)
+```
+
+### Plot predicted symptom trajectories by SI
+
+```{r}
+plot_trajectories_by_group(fit = fit_unified_log_mod_time,
+                           diagnosis = 'baseline_si_any',
+                           days_list = days_contrast) 
+```
+
+### Report effect sizes
+
+```{r}
+tabulate_effect_size(fit = fit_unified_log_mod_time, 
+                           diagnosis = 'baseline_si_any',
+                           days_list = days_contrast)
+```
+
+### Plot predicted symptom trajectories by antidepressants
+
+```{r}
+plot_trajectories_by_group(fit = fit_unified_log_mod_time,
+                           diagnosis = 'antidepressant_load',
+                           days_list = days_contrast) 
+```
+
+### Report effect sizes
+
+```{r}
+tabulate_effect_size(fit = fit_unified_log_mod_time, 
+                           diagnosis = 'antidepressant_load',
+                           days_list = days_contrast)
+```
+
+### Plot predicted symptom trajectories by antipsychotics
+
+```{r}
+plot_trajectories_by_group(fit = fit_unified_log_mod_time,
+                           diagnosis = 'antipsychotic_load',
+                           days_list = days_contrast) 
+```
+
+### Report effect sizes
+
+```{r}
+tabulate_effect_size(fit = fit_unified_log_mod_time, 
+                           diagnosis = 'antipsychotic_load',
+                           days_list = days_contrast)
+```
+
+### Plot predicted symptom trajectories by benzodiazepines
+
+```{r}
+plot_trajectories_by_group(fit = fit_unified_log_mod_time,
+                           diagnosis = 'benzodiazepine_load',
+                           days_list = days_contrast) 
+```
+
+### Report effect sizes
+
+```{r}
+tabulate_effect_size(fit = fit_unified_log_mod_time, 
+                           diagnosis = 'benzodiazepine_load',
+                           days_list = days_contrast)
+```
+
+### Plot predicted symptom trajectories by benzodiazepines
+
+```{r}
+plot_trajectories_by_group(fit = fit_unified_log_mod_time,
+                           diagnosis = 'non_benzodiazepine_anxiolytic_sedative_load',
+                           days_list = days_contrast) 
+```
+
+### Report effect sizes
+
+```{r}
+tabulate_effect_size(fit = fit_unified_log_mod_time, 
+                           diagnosis = 'non_benzodiazepine_anxiolytic_sedative_load',
+                           days_list = days_contrast)
+```
+
+### Plot predicted symptom trajectories by mood stabilizers
+
+```{r}
+plot_trajectories_by_group(fit = fit_unified_log_mod_time,
+                           diagnosis = 'mood_stabilizer_load',
+                           days_list = days_contrast) 
+```
+
+### Report effect sizes
+
+```{r}
+tabulate_effect_size(fit = fit_unified_log_mod_time, 
+                           diagnosis = 'mood_stabilizer_load',
+                           days_list = days_contrast)
+```
+
+### Plot predicted symptom trajectories by stimulants
+
+```{r}
+plot_trajectories_by_group(fit = fit_unified_log_mod_time,
+                           diagnosis = 'stimulant_load',
+                           days_list = days_contrast) 
+```
+
+### Report effect sizes
+
+```{r}
+tabulate_effect_size(fit = fit_unified_log_mod_time, 
+                           diagnosis = 'stimulant_load',
+                           days_list = days_contrast)
+```
+
+### Plot predicted symptom trajectories by other psychotropic medications
+
+```{r}
+plot_trajectories_by_group(fit = fit_unified_log_mod_time,
+                           diagnosis = 'other_psychotropic_medication_load',
+                           days_list = days_contrast) 
+```
+
+### Report effect sizes
+
+```{r}
+tabulate_effect_size(fit = fit_unified_log_mod_time, 
+                           diagnosis = 'other_psychotropic_medication_load',
+                           days_list = days_contrast)
+```
+
+### Plot predicted symptom trajectories by sex
+
+```{r}
+plot_trajectories_by_group(fit = fit_unified_log_mod_time,
+                           diagnosis = 'sex_assigned_at_birth',
+                           days_list = days_contrast) 
+```
+
+### Report effect sizes
+
+```{r}
+tabulate_effect_size(fit = fit_unified_log_mod_time, 
+                           diagnosis = 'sex_assigned_at_birth',
+                           days_list = days_contrast)
+```
+
+### Plot predicted symptom trajectories by per-protocol
+
+```{r}
+plot_trajectories_by_group(fit = fit_unified_log_mod_time,
+                           diagnosis = 'per_protocol',
+                           days_list = days_contrast) 
+```
+
+### Report effect sizes
+
+```{r}
+tabulate_effect_size(fit = fit_unified_log_mod_time, 
+                           diagnosis = 'per_protocol',
+                           days_list = days_contrast)
+```
+
+### Model diagnostics
+
+```{r}
+#| fig-height: 10
+#| fig-width: 8
+performance::check_model(fit_unified_log_mod_time)
+```
+
+## Model 4: Interactions with time: categorical age
+
+```{r}
+fit_unified_log_mod_time_age_bin <- 
+  lmer(phq_tot ~ baseline_phq + time_first_infusion_to_phq_log_mod *   (sex_assigned_at_birth + age_bin + per_protocol +
+                                                 primary_diagnosis_bipolar + comorbid_anxiety + 
+                                                 comorbid_ocd + comorbid_ptsd + comorbid_sud + 
+                                                 baseline_si_any + 
+                                                 antidepressant_load + antipsychotic_load + 
+                                                 benzodiazepine_load + non_benzodiazepine_anxiolytic_sedative_load + 
+                                                 mood_stabilizer_load + 
+                                                 stimulant_load + 
+                                                 other_psychotropic_medication_load) +
+         (1|client_id), 
+       data = ember_data_saved, 
+       REML = TRUE)
+```
+
+### Coefficient table
+
+```{r}
+sjPlot::tab_model(fit_unified_log_mod_time_age_bin, p.adjust = "fdr", show.stat = TRUE, show.df = TRUE, file = paste0(path_tables, 'ember_coefficient_table_interaction_effects_age_bins.doc'))
+```
+
+### Plot predicted symptom trajectories by age category
+
+```{r}
+plot_trajectories_by_group(fit = fit_unified_log_mod_time_age_bin,
+                           diagnosis = 'age_bin',
+                           days_list = days_contrast) 
+```
+
+### Report effect sizes
+
+```{r}
+tabulate_effect_size(fit = fit_unified_log_mod_time_age_bin, 
+                           diagnosis = 'age_bin',
+                           days_list = days_contrast)
+```

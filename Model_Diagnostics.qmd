@@ -1,0 +1,131 @@
+---
+title: "Model_Diagnostics"
+author: "Benjamin Wade"
+format: html
+editor: visual
+---
+
+## Load packages
+
+```{r}
+require(DHARMa)
+require(performance)
+require(lme4)
+require(lmerTest)
+require(sjPlot)
+```
+
+## Load models
+
+```{r}
+# main effects
+load('/path/to/main_effects.Rdata')
+
+# interaction effects
+load('/path/to/interaction_effects.Rdata')
+
+# load data
+load('/path/to/data')
+```
+
+## Main effects model
+
+```{r}
+set.seed(123)
+resid <- DHARMa::simulateResiduals(fit_log_mod, n = 1000)
+plot(resid)
+DHARMa::testResiduals(resid)
+DHARMa::testDispersion(resid)
+DHARMa::testOutliers(resid)
+```
+
+### Performance package
+
+```{r}
+performance::check_model(fit_log_mod)
+```
+
+### Examine outliers
+
+```{r}
+outlier_index <- DHARMa::outliers(resid)
+
+boxplot(ember_data_saved$baseline_phq[outlier_index], 
+        ember_data_saved$baseline_phq[-outlier_index])
+
+t.test(ember_data_saved$baseline_phq[outlier_index], 
+        ember_data_saved$baseline_phq[-outlier_index])
+```
+
+### Refit without outliers
+
+```{r}
+data_no_outliers <- ember_data_saved[-outlier_index, ]
+
+predictors <- c("baseline_phq", "age_years_centered_scaled",
+                  "sex_assigned_at_birth", "per_protocol",
+                  grep("^comorbid_|^primary_diagnosis|baseline_si_any", names(ember_data_saved), value=TRUE),
+                  grep('^total', grep('load$', names(ember_data_saved), value = T), value = T, invert = T))
+
+fixed_effects <- paste0(paste0(predictors, collapse=" + "), " + time_first_infusion_to_phq_log_mod")
+  
+form <- reformulate(paste(fixed_effects, "+ (1 | client_id)"), response='phq_tot')
+
+print(form)
+  
+fit_log_mod_no_outliers <- lmer(form, data = data_no_outliers, REML = FALSE)
+
+sjPlot::tab_model(fit_log_mod_no_outliers, p.adjust = "fdr", show.stat = TRUE, show.df = TRUE)
+```
+
+## Interaction effects model
+
+```{r}
+set.seed(123)
+resid_interaction <- DHARMa::simulateResiduals(fit_unified_log_mod_time, n = 1000)
+plot(resid_interaction)
+DHARMa::testResiduals(resid_interaction)
+DHARMa::testDispersion(resid_interaction)
+DHARMa::testOutliers(resid_interaction)
+```
+
+### Performance package
+
+```{r}
+performance::check_model(fit_unified_log_mod_time)
+```
+
+### Examine outliers
+
+```{r}
+outlier_index_interaction <- DHARMa::outliers(resid_interaction)
+
+boxplot(ember_data_saved$baseline_phq[outlier_index_interaction], 
+        ember_data_saved$baseline_phq[-outlier_index_interaction])
+
+t.test(ember_data_saved$baseline_phq[outlier_index_interaction], 
+        ember_data_saved$baseline_phq[-outlier_index_interaction])
+```
+
+### Refit without outliers
+
+```{r}
+data_no_interaction_outliers <- ember_data_saved[-outlier_index_interaction, ]
+
+refit_interaction_no_outliers <- lmer(phq_tot ~ baseline_phq + time_first_infusion_to_phq_log_mod *   (sex_assigned_at_birth + age_bin + per_protocol +
+                                                 primary_diagnosis_bipolar + comorbid_anxiety + 
+                                                 comorbid_ocd + comorbid_ptsd + comorbid_sud + 
+                                                 baseline_si_any + 
+                                                 antidepressant_load + antipsychotic_load + 
+                                                 benzodiazepine_load + non_benzodiazepine_anxiolytic_sedative_load + 
+                                                 mood_stabilizer_load + 
+                                                 stimulant_load + 
+                                                 other_psychotropic_medication_load) +
+         (1|client_id), 
+       data = data_no_interaction_outliers, 
+       REML = TRUE)
+
+sjPlot::tab_model(refit_interaction_no_outliers, p.adjust = "fdr", show.stat = TRUE, show.df = TRUE)
+```
+
+## 
